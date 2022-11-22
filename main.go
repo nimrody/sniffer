@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/pcapgo"
 )
 
 func main() {
@@ -16,18 +16,20 @@ func main() {
 
 	filename := os.Args[1]
 
-	handleRead, err := pcap.OpenOffline(filename)
+	f, err := os.Open(filename)
 	if err != nil {
 		log.Fatal("failed to open file:", err)
 	}
-	defer handleRead.Close()
+	defer f.Close()
+
+	pcapReader, err := pcapgo.NewReader(f)
 
 	var count int
 	var size int
 	var originalSize int
 
 	for {
-		data, ci, err := handleRead.ReadPacketData()
+		data, ci, err := pcapReader.ReadPacketData()
 		if err != nil && err != io.EOF {
 			log.Fatal("reading packet", err)
 		} else if err == io.EOF {
