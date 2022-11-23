@@ -6,6 +6,8 @@ import (
 	"log"
 	"os"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 )
 
@@ -38,6 +40,15 @@ func main() {
 		count++
 		size += len(data)
 		originalSize += ci.Length
+
+		packet := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.Default)
+		if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+			fmt.Println("This is a TCP packet!")
+			// Get actual TCP data from this layer
+			tcp, _ := tcpLayer.(*layers.TCP)
+			fmt.Printf("From src port %d to dst port %d: %s\n", tcp.SrcPort, tcp.DstPort, tcp.Payload)
+		}
+
 	}
 	fmt.Printf("read %d packets, size %d bytes, original size %d bytes\n", count, size, originalSize)
 }
