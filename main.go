@@ -7,7 +7,9 @@ import (
 	"log"
 	"net/textproto"
 	"os"
+	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -27,7 +29,9 @@ strings)
 
 Respose are bulk strings (integers start with ':', Errors start with '-')
 
-Example of a GET command:
+Types of transactions:
+
+1. GET commands
 
 	*2
 	$3
@@ -40,7 +44,7 @@ And the response:
 	$100
 	{"1":"93.47.3.21:50332111","2":50332111,"-3":"nflw","3":"93.47.3.21","4":"alpes","-5":1666879784574}
 
-Example of a SET command:
+2. SET commands
 
 	*4
 	$5
@@ -56,35 +60,93 @@ And the response:
 
 	+OK
 
+3. PING/PONG keepalives
+
+	PING is answered with a PONG
+
+4. Notifications
+
+	Response only
+	"pmessage", "*", "__keyevent@0__:set", "csc[63472aad9a791211b792b0a9]wsa.clonbrd.CA:DA:DC:23:8A:61"
+
 */
+
+const (
+	redisPort = 6379
+)
 
 var streamCount int32
 
-// httpStreamFactory implements tcpassembly.StreamFactory
-type httpStreamFactory struct{}
+// redisStreamFactory implements tcpassembly.StreamFactory
+type redisStreamFactory struct{}
 
-// httpStream will handle the actual decoding of http requests.
-type httpStream struct {
+// redisStream will handle the actual decoding of redis requests.
+type redisStream struct {
 	net, transport gopacket.Flow
-	r              tcpreader.ReaderStream
-	i              int32
+	reader         tcpreader.ReaderStream
+	streamIndex    int32
+	lastTimestamp  time.Time
+	clientRequest  bool // true if this is a flow from the client to the server, false otherwise
 }
 
-func (h *httpStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
-	hstream := &httpStream{
-		net:       net,
-		transport: transport,
-		r:         tcpreader.NewReaderStream(),
-		i:         atomic.AddInt32(&streamCount, 1),
+// Reassembled implements tcpassembly.Stream
+func (s *redisStream) Reassembled(segments []tcpassembly.Reassembly) {
+	for i, segment := range segments {
+		s.lastTimestamp = segment.Seen
+		s.reader.Reassembled(segments[i : i+1])
 	}
-	go hstream.run() // Important... we must guarantee that data from the reader stream is read.
-
-	// ReaderStream implements tcpassembly.Stream, so we can return a pointer to it.
-	return &hstream.r
 }
 
-func (h *httpStream) run() {
-	buf := bufio.NewReader(&h.r)
+// ReassemblyComplete implements tcpassembly.Stream
+func (s *redisStream) ReassemblyComplete() {
+	s.reader.ReassemblyComplete()
+}
+
+func (*redisStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
+	dstPortRaw := transport.Dst().Raw()
+	dstPort := uint16(dstPortRaw[0])<<8 | uint16(dstPortRaw[1])
+
+	rstream := &redisStream{
+		net:           net,
+		transport:     transport,
+		reader:        tcpreader.NewReaderStream(),
+		streamIndex:   atomic.AddInt32(&streamCount, 1),
+		lastTimestamp: time.Time{},
+		clientRequest: dstPort == redisPort,
+	}
+
+	// Important... we must guarantee that data from the reader stream is read.
+	if rstream.clientRequest {
+		go rstream.handleRequests()
+	} else {
+		go rstream.handleResponses()
+	}
+	// ReaderStream implements tcpassembly.Stream, so we can return a pointer to it.
+	return rstream
+}
+
+func redisReadString(tp *textproto.Reader) (string, error) {
+	line, err := tp.ReadLine()
+	if err == io.EOF {
+		return "", err
+	}
+	if line[0] == '+' { // beginning of a simple string
+		line = line[1:]
+	} else if line[0] == '$' { // beginning of a bulk string
+		n, _ := strconv.Atoi(line[1:])
+		line, err = tp.ReadLine() // TODO: should read n characters and ignore CRLF
+		if err == io.EOF {
+			return "", err
+		}
+		if len(line) < n {
+			log.Fatal(fmt.Sprintf("expected %d characters, got %d characters: %s", n, len(line), line))
+		}
+	}
+	return line, nil
+}
+
+func (s *redisStream) handleRequests() {
+	buf := bufio.NewReader(&s.reader)
 	tp := textproto.NewReader(buf)
 	for {
 		line, err := tp.ReadLine()
@@ -93,9 +155,78 @@ func (h *httpStream) run() {
 			return
 		} else if err != nil {
 			log.Println("Error reading stream", err)
-		} else {
-			fmt.Printf("%10d: %s:%s -> %s:%s: %s\n", h.i, h.net.Src(), h.transport.Src(), h.net.Dst(), h.transport.Dst(), line)
+		} else if line[0] == '*' { // beginning of an array (used for sending commnads)
+			n, _ := strconv.Atoi(line[1:])
+			// read n strings
+			lines := make([]string, 0, n)
+			for i := 0; i < n; i++ {
+				line, err = redisReadString(tp)
+				if err != nil {
+					return
+				}
+				lines = append(lines, line)
+			}
+			switch lines[0] {
+			case "GET":
+				key := lines[1]
+				fmt.Printf("%10d: %s: GET %s\n", s.streamIndex, s.lastTimestamp, key)
+			case "SETEX":
+				key := lines[1]
+				ttl, _ := strconv.Atoi(lines[2])
+				value := lines[3]
+				fmt.Printf("%10d: %s: SETEX %s = %s, TTL: %d\n", s.streamIndex, s.lastTimestamp, key, value, ttl)
+			case "PING":
+				// do nothing
+			default:
+			}
 		}
+
+		// fmt.Printf("%10d: %s: %s:%s -> %s:%s: %s\n", s.streamIndex, s.lastTimestamp, s.net.Src(), s.transport.Src(), s.net.Dst(), s.transport.Dst(), line)
+	}
+}
+
+/*
+Responses are typically a single value (OK, PONG, get-response) but
+
+	may also be arrays if this is a key event
+*/
+func (s *redisStream) handleResponses() {
+	buf := bufio.NewReader(&s.reader)
+	tp := textproto.NewReader(buf)
+	for {
+		line, err := tp.ReadLine()
+		if err == io.EOF {
+			// We must read until we see an EOF... very important!
+			return
+		} else if err != nil {
+			log.Println("Error reading stream", err)
+		} else if line[0] == '*' { // beginning of an array (used for sending commnads)
+			n, _ := strconv.Atoi(line[1:])
+			// read n strings
+			lines := make([]string, 0, n)
+			for i := 0; i < n; i++ {
+				line, err = redisReadString(tp)
+				if err != nil {
+					return
+				}
+				lines = append(lines, line)
+			}
+			switch lines[0] {
+			case "GET":
+				key := lines[1]
+				fmt.Printf("%10d: %s: GET %s\n", s.streamIndex, s.lastTimestamp, key)
+			case "SETEX":
+				key := lines[1]
+				ttl, _ := strconv.Atoi(lines[2])
+				value := lines[3]
+				fmt.Printf("%10d: %s: SETEX %s = %s, TTL: %d\n", s.streamIndex, s.lastTimestamp, key, value, ttl)
+			case "PING":
+				// do nothing
+			default:
+			}
+		}
+
+		// fmt.Printf("%10d: %s: %s:%s -> %s:%s: %s\n", s.streamIndex, s.lastTimestamp, s.net.Src(), s.transport.Src(), s.net.Dst(), s.transport.Dst(), line)
 	}
 }
 
@@ -119,12 +250,12 @@ func main() {
 	var originalSize int
 
 	// Set up assembly
-	streamFactory := &httpStreamFactory{}
+	streamFactory := &redisStreamFactory{}
 	streamPool := tcpassembly.NewStreamPool(streamFactory)
 	assembler := tcpassembly.NewAssembler(streamPool)
 
 	for {
-		data, ci, err := pcapReader.ReadPacketData()
+		data, captureInfo, err := pcapReader.ReadPacketData()
 		if err != nil && err != io.EOF {
 			log.Fatal("reading packet", err)
 		} else if err == io.EOF {
@@ -132,13 +263,13 @@ func main() {
 		}
 		count++
 		size += len(data)
-		originalSize += ci.Length
+		originalSize += captureInfo.Length
 
 		packet := gopacket.NewPacket(data, layers.LayerTypeEthernet, gopacket.Default)
 		if tcpLayer := packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 			// Get actual TCP data from this layer
 			tcp, _ := tcpLayer.(*layers.TCP)
-			assembler.AssembleWithTimestamp(packet.NetworkLayer().NetworkFlow(), tcp, packet.Metadata().Timestamp)
+			assembler.AssembleWithTimestamp(packet.NetworkLayer().NetworkFlow(), tcp, captureInfo.Timestamp)
 		}
 
 	}
