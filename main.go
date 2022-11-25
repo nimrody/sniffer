@@ -256,8 +256,8 @@ func (s *redisStream) handleResponses() {
 			}
 
 			found := false
-			for i := 0; i < 50; i++ {
-				if reqList, ok := pendingRequests[s.flowKey]; ok {
+			for i := 0; i < 5000; i++ {
+				if reqList, ok := pendingRequests[s.flowKey]; ok && len(reqList) > 0 {
 					//fmt.Printf("%10d: %s: response %q\n", s.streamIndex, s.lastTimestamp, lines[0])
 					req := reqList[0]
 					pendingRequests[s.flowKey] = reqList[1:]
@@ -267,7 +267,7 @@ func (s *redisStream) handleResponses() {
 					break
 				} else {
 					tp.Fill()
-					time.Sleep(50 * time.Millisecond)
+					time.Sleep(1 * time.Millisecond)
 				}
 			}
 			if !found {
