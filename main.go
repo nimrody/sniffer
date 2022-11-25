@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +14,7 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/google/gopacket/tcpassembly"
+	"github.com/nimrody/my-sinffer/bufio"
 	"github.com/nimrody/my-sinffer/tcpreader"
 )
 
@@ -58,6 +59,7 @@ Types of transactions:
 
 const (
 	redisPort = 6379
+	bufSize   = 1000000
 )
 
 type redisRequest struct {
@@ -84,9 +86,11 @@ type redisStream struct {
 
 // Reassembled implements tcpassembly.Stream
 func (s *redisStream) Reassembled(segments []tcpassembly.Reassembly) {
+	fmt.Printf("%10d: New %d segment: req: %s   %v\n", s.streamIndex, len(segments), s.flowKey, s.clientRequest)
 	for i, segment := range segments {
 		s.lastTimestamp = segment.Seen
 		s.reader.Reassembled(segments[i : i+1])
+		fmt.Printf("%10d: processed 1-segment: req: %s   %v\n", s.streamIndex, s.flowKey, s.clientRequest)
 	}
 }
 
@@ -130,6 +134,15 @@ func (*redisStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream 
 	return rstream
 }
 
+func readLine(tp *bufio.Reader) (string, error) {
+	line, err := tp.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	line = strings.TrimSuffix(line, "\r\n")
+	return line, err
+}
+
 // read a single simple string "+XXX\n" or a bulk string "$n\nXXXXX\n"
 func redisReadString0(line string, tp *bufio.Reader) (string, error) {
 	var err error
@@ -139,7 +152,7 @@ func redisReadString0(line string, tp *bufio.Reader) (string, error) {
 		return "not-found", nil
 	} else if line[0] == '$' { // beginning of a bulk string
 		n, _ := strconv.Atoi(line[1:])
-		line, err = tp.ReadString('\n') // TODO: should read n characters and ignore CRLF
+		line, err = readLine(tp) // TODO: should read n characters and ignore CRLF
 		if err == io.EOF {
 			return "", err
 		}
@@ -153,7 +166,7 @@ func redisReadString0(line string, tp *bufio.Reader) (string, error) {
 }
 
 func redisReadString(tp *bufio.Reader) (string, error) {
-	line, err := tp.ReadString('\n')
+	line, err := readLine(tp)
 	if err == io.EOF {
 		return "", err
 	}
@@ -161,7 +174,7 @@ func redisReadString(tp *bufio.Reader) (string, error) {
 }
 
 func redisReadArray(tp *bufio.Reader) ([]string, error) {
-	line, err := tp.ReadString('\n')
+	line, err := readLine(tp)
 	if err != nil {
 		// We must read until we see an EOF... very important!
 		return []string{}, err
@@ -169,6 +182,9 @@ func redisReadArray(tp *bufio.Reader) ([]string, error) {
 	// beginning of an array (used for sending commnads or keyevent responses)
 	if line[0] == '*' {
 		n, _ := strconv.Atoi(line[1:])
+		if n < 1 {
+			log.Fatalf("redisReadArray: %d elements array: %q", n, line)
+		}
 		// read n strings
 		lines := make([]string, 0, n)
 		for i := 0; i < n; i++ {
@@ -183,11 +199,14 @@ func redisReadArray(tp *bufio.Reader) ([]string, error) {
 
 	// otherwise it's either a simple string or a bulk string
 	line, err = redisReadString0(line, tp)
+	if err != nil {
+		log.Fatal("redisReadArray", err)
+	}
 	return []string{line}, err
 }
 
 func (s *redisStream) handleRequests() {
-	tp := bufio.NewReader(&s.reader)
+	tp := bufio.NewReaderSize(&s.reader, bufSize)
 	for {
 		lines, err := redisReadArray(tp)
 		if err == io.EOF {
@@ -217,7 +236,7 @@ Responses are typically a single value (OK, PONG, get-response) but
 may also be arrays if this is a key event
 */
 func (s *redisStream) handleResponses() {
-	tp := bufio.NewReader(&s.reader)
+	tp := bufio.NewReaderSize(&s.reader, bufSize)
 	for {
 		lines, err := redisReadArray(tp)
 		if err == io.EOF {
@@ -247,6 +266,7 @@ func (s *redisStream) handleResponses() {
 					found = true
 					break
 				} else {
+					tp.Fill()
 					time.Sleep(50 * time.Millisecond)
 				}
 			}
