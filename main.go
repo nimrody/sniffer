@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/textproto"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -132,7 +131,7 @@ func (*redisStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream 
 }
 
 // read a single simple string "+XXX\n" or a bulk string "$n\nXXXXX\n"
-func redisReadString0(line string, tp *textproto.Reader) (string, error) {
+func redisReadString0(line string, tp *bufio.Reader) (string, error) {
 	var err error
 	if line[0] == '+' { // beginning of a simple string
 		line = line[1:]
@@ -140,7 +139,7 @@ func redisReadString0(line string, tp *textproto.Reader) (string, error) {
 		return "not-found", nil
 	} else if line[0] == '$' { // beginning of a bulk string
 		n, _ := strconv.Atoi(line[1:])
-		line, err = tp.ReadLine() // TODO: should read n characters and ignore CRLF
+		line, err = tp.ReadString('\n') // TODO: should read n characters and ignore CRLF
 		if err == io.EOF {
 			return "", err
 		}
@@ -153,16 +152,16 @@ func redisReadString0(line string, tp *textproto.Reader) (string, error) {
 	return line, nil
 }
 
-func redisReadString(tp *textproto.Reader) (string, error) {
-	line, err := tp.ReadLine()
+func redisReadString(tp *bufio.Reader) (string, error) {
+	line, err := tp.ReadString('\n')
 	if err == io.EOF {
 		return "", err
 	}
 	return redisReadString0(line, tp)
 }
 
-func redisReadArray(tp *textproto.Reader) ([]string, error) {
-	line, err := tp.ReadLine()
+func redisReadArray(tp *bufio.Reader) ([]string, error) {
+	line, err := tp.ReadString('\n')
 	if err != nil {
 		// We must read until we see an EOF... very important!
 		return []string{}, err
@@ -188,8 +187,7 @@ func redisReadArray(tp *textproto.Reader) ([]string, error) {
 }
 
 func (s *redisStream) handleRequests() {
-	buf := bufio.NewReader(&s.reader)
-	tp := textproto.NewReader(buf)
+	tp := bufio.NewReader(&s.reader)
 	for {
 		lines, err := redisReadArray(tp)
 		if err == io.EOF {
@@ -219,8 +217,7 @@ Responses are typically a single value (OK, PONG, get-response) but
 may also be arrays if this is a key event
 */
 func (s *redisStream) handleResponses() {
-	buf := bufio.NewReader(&s.reader)
-	tp := textproto.NewReader(buf)
+	tp := bufio.NewReader(&s.reader)
 	for {
 		lines, err := redisReadArray(tp)
 		if err == io.EOF {
