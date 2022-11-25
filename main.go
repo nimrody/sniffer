@@ -15,7 +15,7 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/google/gopacket/tcpassembly"
-	"github.com/google/gopacket/tcpassembly/tcpreader"
+	"github.com/nimrody/my-sinffer/tcpreader"
 )
 
 /*
@@ -34,30 +34,26 @@ Integers are encoded as ':<number>'
 Types of transactions:
 
 1. GET commands
-
 	["GET", <key-string>] -> <value-string>
 
 2. SETEX commands (SET + EXPIRE combination)
-
 	["SETEX", <key-string>, <value-string> <number-string>] -> "OK"
 
 3. SET command
-   ["SET", <key-string>, <value-string>] -> "OK"
+ 	["SET", <key-string>, <value-string>] -> "OK"
 
 4. SETNX command (Set if not exists)
-   ["SET", <key-string>, <value-string>] -> 0 or 1  (1 if set, 0 if not)
+ 	["SET", <key-string>, <value-string>] -> 0 or 1  (1 if set, 0 if not)
 
 5. EXPIRE
-   ["EXPIRE", <key-string>, <number-string>] -> 0 or 1  (1 if set, 0 if not since the key does not exist)
+	["EXPIRE", <key-string>, <number-string>] -> 0 or 1  (1 if set, 0 if not since the key does not exist)
 
-3. PING/PONG keepalives
-
+6. PING/PONG keepalives
 	["PING"] -> "PONG"
 
-4. Notifications
-
+7. Notifications
 	Response only - on a separate TCP connection with no commands
-	"pmessage", "*", "__keyevent@0__:set", "csc[63472aad9a791211b792b0a9]wsa.clonbrd.CA:DA:DC:23:8A:61"
+	["pmessage", "*", "__keyevent@0__:set", "csc[63472aad9a791211b792b0a9]wsa.clonbrd.CA:DA:DC:23:8A:61"]
 
 */
 
@@ -65,13 +61,14 @@ const (
 	redisPort = 6379
 )
 
-type getRequest struct {
-	key         string // GET key
+type redisRequest struct {
+	reqType     string
+	key         string // key for GET, SET, EXPIRE commands
 	requestTime time.Time
 }
 
 var streamCount int32
-var pendingRequests = make(map[string][]getRequest)
+var pendingRequests = make(map[string][]redisRequest)
 
 // redisStreamFactory implements tcpassembly.StreamFactory
 type redisStreamFactory struct{}
@@ -203,33 +200,16 @@ func (s *redisStream) handleRequests() {
 			log.Fatal("Error reading stream", err)
 		}
 
-		switch lines[0] {
-		case "GET":
-			key := lines[1]
-			fmt.Printf("%10d: %s: GET %s ADDED\n", s.streamIndex, s.lastTimestamp, key)
-			pendingRequests[s.flowKey] = append(pendingRequests[s.flowKey], getRequest{key: key, requestTime: s.lastTimestamp})
-		case "SETEX":
-			key := lines[1]
-			ttl, _ := strconv.Atoi(lines[2])
-			value := lines[3]
-			fmt.Printf("%10d: %s: SETEX %s = %s, TTL: %d\n", s.streamIndex, s.lastTimestamp, key, value, ttl)
-		case "SETNX":
-			key := lines[1]
-			ttl, _ := strconv.Atoi(lines[2])
-			value := lines[3]
-			fmt.Printf("%10d: %s: SETEX %s = %s, TTL: %d\n", s.streamIndex, s.lastTimestamp, key, value, ttl)
-		case "EXPIRE":
-			key := lines[1]
-			ttl, _ := strconv.Atoi(lines[2])
-			value := lines[3]
-			fmt.Printf("%10d: %s: SETEX %s = %s, TTL: %d\n", s.streamIndex, s.lastTimestamp, key, value, ttl)
-		case "PING":
-			// do nothing
-		case "pmessage":
-			// do nothing
-		default:
-			fmt.Lo
+		var key string
+		command := lines[0]
+
+		if len(lines) > 1 {
+			key = lines[1] // key is always the first agument (for GET/SET/EXPIRE)
 		}
+
+		req := redisRequest{reqType: command, key: key, requestTime: s.lastTimestamp}
+
+		pendingRequests[s.flowKey] = append(pendingRequests[s.flowKey], req)
 		// fmt.Printf("%10d: %s: %s:%s -> %s:%s: %s\n", s.streamIndex, s.lastTimestamp, s.net.Src(), s.transport.Src(), s.net.Dst(), s.transport.Dst(), line)
 	}
 }
@@ -254,22 +234,28 @@ func (s *redisStream) handleResponses() {
 		switch lines[0] {
 		case "pmessage":
 			// keyevent message - ignore
-		case "PONG", "OK":
-			// do nothing
 		default:
 			if len(lines) > 1 {
 				log.Fatalf("expected 1 value response, got %q", lines)
 			}
 
-			if reqList, ok := pendingRequests[s.flowKey]; ok {
-				//fmt.Printf("%10d: %s: response %q\n", s.streamIndex, s.lastTimestamp, lines[0])
-				req := reqList[0]
-				pendingRequests[s.flowKey] = reqList[1:]
-				fmt.Printf("%s: GET %s => %s  latency: %d\n", s.flowKey, req.key, lines[0],
-					s.lastTimestamp.UnixMicro()-req.requestTime.UnixMicro())
-
-			} else {
-				log.Fatalf("got response for flow %s with no matching GET", s.flowKey)
+			found := false
+			for i := 0; i < 50; i++ {
+				if reqList, ok := pendingRequests[s.flowKey]; ok {
+					//fmt.Printf("%10d: %s: response %q\n", s.streamIndex, s.lastTimestamp, lines[0])
+					req := reqList[0]
+					pendingRequests[s.flowKey] = reqList[1:]
+					fmt.Printf("%s: %s %s => %s  latency: %d\n", s.flowKey, req.reqType, req.key, lines[0],
+						s.lastTimestamp.UnixMicro()-req.requestTime.UnixMicro())
+					found = true
+					break
+				} else {
+					time.Sleep(50 * time.Millisecond)
+				}
+			}
+			if !found {
+				log.Printf("map=%v", pendingRequests)
+				log.Fatalf("got %s response for flow %s with no matching GET", lines[0], s.flowKey)
 			}
 
 		}
