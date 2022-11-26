@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -70,6 +71,7 @@ type redisRequest struct {
 
 var streamCount int32
 var pendingRequests = make(map[string][]redisRequest)
+var pendingRequestsLock sync.RWMutex
 
 // redisStreamFactory implements tcpassembly.StreamFactory
 type redisStreamFactory struct{}
@@ -86,11 +88,11 @@ type redisStream struct {
 
 // Reassembled implements tcpassembly.Stream
 func (s *redisStream) Reassembled(segments []tcpassembly.Reassembly) {
-	fmt.Printf("%10d: New %d segment: req: %s   %v\n", s.streamIndex, len(segments), s.flowKey, s.clientRequest)
+	// log.Printf("%10d: New %d segment: req: %s   %v\n", s.streamIndex, len(segments), s.flowKey, s.clientRequest)
 	for i, segment := range segments {
 		s.lastTimestamp = segment.Seen
 		s.reader.Reassembled(segments[i : i+1])
-		fmt.Printf("%10d: processed 1-segment: req: %s   %v\n", s.streamIndex, s.flowKey, s.clientRequest)
+		// fmt.Printf("%10d: processed 1-segment: req: %s   %v\n", s.streamIndex, s.flowKey, s.clientRequest)
 	}
 }
 
@@ -226,7 +228,10 @@ func (s *redisStream) handleRequests() {
 
 		req := redisRequest{reqType: command, key: key, requestTime: s.lastTimestamp}
 
+		pendingRequestsLock.Lock()
 		pendingRequests[s.flowKey] = append(pendingRequests[s.flowKey], req)
+		pendingRequestsLock.Unlock()
+
 		// fmt.Printf("%10d: %s: %s:%s -> %s:%s: %s\n", s.streamIndex, s.lastTimestamp, s.net.Src(), s.transport.Src(), s.net.Dst(), s.transport.Dst(), line)
 	}
 }
@@ -257,18 +262,24 @@ func (s *redisStream) handleResponses() {
 
 			found := false
 			for i := 0; i < 50000; i++ {
+				pendingRequestsLock.RLock()
 				if reqList, ok := pendingRequests[s.flowKey]; ok && len(reqList) > 0 {
 					//fmt.Printf("%10d: %s: response %q\n", s.streamIndex, s.lastTimestamp, lines[0])
 					req := reqList[0]
 					pendingRequests[s.flowKey] = reqList[1:]
-					fmt.Printf("%s: %s %s => %s  latency: %d\n", s.flowKey, req.reqType, req.key, lines[0],
-						s.lastTimestamp.UnixMicro()-req.requestTime.UnixMicro())
+					latency := s.lastTimestamp.UnixMicro() - req.requestTime.UnixMicro()
+					if latency > 10000 {
+						log.Fatalf("out of range latency: %s: %s %s => %s  latency: %v = %v - %v\n", s.flowKey, req.reqType, req.key, lines[0], latency, s.lastTimestamp, req.requestTime)
+					}
+					fmt.Printf("%s: %s %s => %s  latency: %d\n", s.flowKey, req.reqType, req.key, lines[0], latency)
+
 					found = true
+					pendingRequestsLock.RUnlock()
 					break
-				} else {
-					tp.Fill()
-					// time.Sleep(1 * time.Millisecond)
 				}
+				pendingRequestsLock.RUnlock()
+				tp.Fill()
+				// time.Sleep(1 * time.Millisecond)
 			}
 			if !found {
 				log.Printf("map=%v", pendingRequests)
