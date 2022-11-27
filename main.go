@@ -81,7 +81,7 @@ type redisStream struct {
 	net, transport gopacket.Flow
 	flowKey        string
 	flowLabel      string // what we display in logs
-	reader         tcpreader.ReaderStream
+	reader         *tcpreader.ReaderStream
 	streamIndex    int32
 	clientRequest  bool // true if this is a flow from the client to the server, false otherwise
 }
@@ -106,7 +106,7 @@ func (*redisStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream 
 		transport:     transport,
 		flowKey:       flowKey,
 		flowLabel:     flowLabel,
-		reader:        tcpreader.NewReaderStream(),
+		reader:        tcpreader.NewReaderStream(flowLabel),
 		streamIndex:   atomic.AddInt32(&streamCount, 1),
 		clientRequest: clientRequest,
 	}
@@ -121,7 +121,7 @@ func (*redisStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream 
 		go rstream.handleResponses()
 	}
 	// ReaderStream implements tcpassembly.Stream, so we can return a pointer to it.
-	return &rstream.reader
+	return rstream.reader
 }
 
 // read a single simple string "+XXX\n" or a bulk string "$n\nXXXXX\n"
@@ -154,7 +154,7 @@ func redisReadString(tp *tcpreader.ReaderStream) (string, time.Time, error) {
 	return redisReadString0(line, timestamp, tp)
 }
 
-func redisReadArray(tp *tcpreader.ReaderStream) ([]string, time.Time, error) {
+func redisReadArrayOrString(tp *tcpreader.ReaderStream) ([]string, time.Time, error) {
 	line, timestamp, err := tp.ReadLine("redisReadArray")
 	if err != nil {
 		// We must read until we see an EOF... very important!
@@ -189,13 +189,14 @@ func redisReadArray(tp *tcpreader.ReaderStream) ([]string, time.Time, error) {
 func (s *redisStream) handleRequests() {
 	defer wg.Done()
 	for {
-		lines, timestamp, err := redisReadArray(&s.reader)
+		lines, timestamp, err := redisReadArrayOrString(s.reader)
 		if err == io.EOF {
 			// We must read until we see an EOF... very important!
+			log.Printf("Req:  %s: received EOF\n", s.flowLabel)
 			return
 		}
 		if err != nil {
-			log.Fatal("Error reading stream", err)
+			log.Fatalf("Req:  %s: Error reading stream %v", s.flowLabel, err)
 		}
 
 		var key string
@@ -222,14 +223,14 @@ may also be arrays if this is a key event
 func (s *redisStream) handleResponses() {
 	defer wg.Done()
 	for {
-		lines, timestamp, err := redisReadArray(&s.reader)
+		lines, timestamp, err := redisReadArrayOrString(s.reader)
 		if err == io.EOF {
 			// We must read until we see an EOF... very important!
 			log.Printf("Resp: %s: received EOF\n", s.flowLabel)
 			return
 		}
 		if err != nil {
-			log.Fatal("Error reading stream", err)
+			log.Fatalf("Req:  %s: Error reading stream, %v", s.flowLabel, err)
 		}
 		log.Printf("Resp: %s: %v\n", s.flowLabel, lines)
 
@@ -259,6 +260,7 @@ func (s *redisStream) handleResponses() {
 					break
 				}
 				pendingRequestsLock.RUnlock()
+				time.Sleep(10 * time.Millisecond)
 				s.reader.Fill()
 				// time.Sleep(1 * time.Millisecond)
 			}
@@ -272,6 +274,8 @@ func (s *redisStream) handleResponses() {
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
 	if len(os.Args) != 2 {
 		log.Fatal("expected pcap filename argument")
 	}

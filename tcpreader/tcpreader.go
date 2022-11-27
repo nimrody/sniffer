@@ -48,6 +48,7 @@ package tcpreader
 import (
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -82,6 +83,7 @@ type ReaderStream struct {
 	current          []tcpassembly.Reassembly
 	currentByteIndex int
 	initiated        bool
+	label            string
 }
 
 // ReaderStreamOptions provides user-resettable options for a ReaderStream.
@@ -93,12 +95,12 @@ type ReaderStreamOptions struct {
 }
 
 // NewReaderStream returns a new ReaderStream object.
-func NewReaderStream() ReaderStream {
-	r := ReaderStream{
+func NewReaderStream(label string) *ReaderStream {
+	return &ReaderStream{
 		reassembled: make(chan []tcpassembly.Reassembly, 1000),
 		initiated:   true,
+		label:       label,
 	}
-	return r
 }
 
 // Reassembled implements tcpassembly.Stream's Reassembled function.
@@ -106,8 +108,23 @@ func (r *ReaderStream) Reassembled(reassembly []tcpassembly.Reassembly) {
 	if !r.initiated {
 		panic("ReaderStream not created via NewReaderStream")
 	}
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%d:[", len(reassembly)))
+	for _, segment := range reassembly {
+		sb.WriteString(fmt.Sprintf("%q,", string(segment.Bytes)))
+	}
+	sb.WriteByte(']')
+	log.Printf("%s: Reassembled: %v\n", r.label, sb.String())
+
+	reassemblyClone := make([]tcpassembly.Reassembly, len(reassembly))
+	for i := 0; i < len(reassembly); i++ {
+		r := tcpassembly.Reassembly{Bytes: make([]byte, len(reassembly[i].Bytes)), Seen: reassembly[i].Seen}
+		copy(r.Bytes, reassembly[i].Bytes)
+		reassemblyClone[i] = r
+	}
+
 	select {
-	case r.reassembled <- reassembly:
+	case r.reassembled <- reassemblyClone:
 	default:
 		panic("blocked on sending to channel")
 	}
@@ -180,7 +197,10 @@ func (r *ReaderStream) ReadLine(caller string) (string, time.Time, error) {
 		if b == '\n' {
 			line := strings.TrimSuffix(sb.String(), "\r\n")
 
-			// fmt.Printf("ReadString %v returned %q\n", caller, line)
+			log.Printf("%p ReadString %v returned %q\n", r, caller, line)
+			if len(line) == 0 {
+				log.Fatalf("empty line %s\n", sb.String())
+			}
 			return line, timestamp, nil
 		}
 	}
