@@ -82,6 +82,7 @@ type ReaderStream struct {
 	current          []tcpassembly.Reassembly
 	currentByteIndex int
 	initiated        bool
+	skippedBytes     int // > 0 if skipped any bytes (and will skip the remaining part of the stream)
 	label            string
 }
 
@@ -109,6 +110,7 @@ func init() {
 
 // NewReaderStream returns a new ReaderStream object.
 func NewReaderStream(label string) *ReaderStream {
+	log.Printf("%s new flow", label)
 	return &ReaderStream{
 		reassembled: make(chan []tcpassembly.Reassembly, 1000),
 		initiated:   true,
@@ -121,6 +123,7 @@ func (r *ReaderStream) Reassembled(reassembly []tcpassembly.Reassembly) {
 	if !r.initiated {
 		panic("ReaderStream not created via NewReaderStream")
 	}
+
 	// var sb strings.Builder
 	// sb.WriteString(fmt.Sprintf("%d:[", len(reassembly)))
 	// for _, segment := range reassembly {
@@ -129,17 +132,32 @@ func (r *ReaderStream) Reassembled(reassembly []tcpassembly.Reassembly) {
 	// sb.WriteByte(']')
 	// log.Printf("%s: Reassembled: %v\n", r.label, sb.String())
 
-	reassemblyClone := make([]tcpassembly.Reassembly, len(reassembly))
+	// have to clone before sending to channel since caller re-allocates the segments
+	reassemblyClone := make([]tcpassembly.Reassembly, 0, len(reassembly))
 	for i := 0; i < len(reassembly); i++ {
-		r := tcpassembly.Reassembly{Bytes: make([]byte, len(reassembly[i].Bytes)), Seen: reassembly[i].Seen}
-		copy(r.Bytes, reassembly[i].Bytes)
-		reassemblyClone[i] = r
+
+		if reassembly[i].Skip == -1 {
+			log.Printf("%s skipping unknown number of bytes", r.label)
+			r.skippedBytes += 1 // unknown
+		} else if reassembly[i].Skip > 0 {
+			r.skippedBytes += reassembly[i].Skip
+		}
+
+		if r.skippedBytes > 0 {
+			r.skippedBytes += len(reassembly[i].Bytes)
+		} else {
+			r := tcpassembly.Reassembly{Bytes: make([]byte, len(reassembly[i].Bytes)), Seen: reassembly[i].Seen}
+			copy(r.Bytes, reassembly[i].Bytes)
+			reassemblyClone = append(reassemblyClone, r)
+		}
 	}
 
-	select {
-	case r.reassembled <- reassemblyClone:
-	default:
-		panic("blocked on sending to channel")
+	if len(reassemblyClone) > 0 {
+		select {
+		case r.reassembled <- reassemblyClone:
+		default:
+			panic("blocked on sending to channel - increase queue size")
+		}
 	}
 }
 
@@ -237,7 +255,13 @@ func (r *ReaderStream) ReadLineN(caller string, n int) (string, time.Time, error
 			// log.Printf("ReadString %s returned ERROR %q %q\n", caller, err, io.EOF)
 			return sb.String(), timestamp, err
 		}
-		sb.WriteByte(b) // will return the delimiter too
+		if b == '\r' {
+			sb.WriteString("\\r")
+		} else if b == '\n' {
+			sb.WriteString("\\n")
+		} else {
+			sb.WriteByte(b)
+		}
 	}
 
 	line := sb.String()
@@ -267,4 +291,8 @@ func (r *ReaderStream) ReadLineN(caller string, n int) (string, time.Time, error
 func (r *ReaderStream) Fill() {
 	// panic("todo")
 	// nop
+}
+
+func (r *ReaderStream) Skipped() int {
+	return r.skippedBytes
 }

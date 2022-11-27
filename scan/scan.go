@@ -69,7 +69,6 @@ type redisRequest struct {
 }
 
 var streamCount int32
-var totalSkippedBytes int32
 var pendingRequests = make(map[string][]redisRequest)
 var pendingRequestsLock sync.Mutex
 var wg sync.WaitGroup
@@ -193,28 +192,13 @@ func (s *redisStream) handleRequests() {
 		lines, timestamp, err := redisReadArrayOrString(s.reader)
 		if err == io.EOF {
 			// We must read until we see an EOF... very important!
-			log.Printf("Req:  %s: received EOF, skipped %d bytes\n", s.flowLabel, s.reader.Skipped())
-			atomic.AddInt32(&totalSkippedBytes, int32(s.reader.Skipped()))
+			log.Printf("Req:  %s: received EOF\n", s.flowLabel)
 			return
 		}
 		if err != nil {
-			log.Fatalf("Req:  %s: Error reading stream %v", s.flowLabel, err)
+			log.Fatalf("Req:   %s: Error reading stream, %v", s.flowLabel, err)
 		}
-
-		var key string
-		command := lines[0]
-
-		if len(lines) > 1 {
-			key = lines[1] // key is always the first agument (for GET/SET/EXPIRE)
-		}
-
-		req := redisRequest{reqType: command, key: key, requestTime: timestamp}
-
-		pendingRequestsLock.Lock()
-		pendingRequests[s.flowKey] = append(pendingRequests[s.flowKey], req)
-		pendingRequestsLock.Unlock()
-
-		// log.Printf("Req:  %s: %v\n", s.flowLabel, lines)
+		log.Printf("%s: %s: %v\n", timestamp.Format(time.StampMicro), s.flowLabel, lines)
 	}
 }
 
@@ -228,71 +212,18 @@ func (s *redisStream) handleResponses() {
 		lines, timestamp, err := redisReadArrayOrString(s.reader)
 		if err == io.EOF {
 			// We must read until we see an EOF... very important!
-			log.Printf("Resp: %s: received EOF, skipped %d bytes\n", s.flowLabel, s.reader.Skipped())
-			atomic.AddInt32(&totalSkippedBytes, int32(s.reader.Skipped()))
+			log.Printf("Resp: %s: received EOF\n", s.flowLabel)
 			return
 		}
 		if err != nil {
-			log.Fatalf("Req:  %s: Error reading stream, %v", s.flowLabel, err)
+			log.Fatalf("Resp:  %s: Error reading stream, %v", s.flowLabel, err)
 		}
-		// log.Printf("Resp: %s: %v\n", s.flowLabel, lines)
-
-		switch lines[0] {
-		case "pmessage":
-			// keyevent message - ignore
-		default:
-			if len(lines) > 1 {
-				log.Fatalf("%10d: %s: expected 1 value response, got %q", s.streamIndex, s.flowLabel, lines)
-			}
-
-			found := false
-			for i := 0; i < 50000; i++ {
-				pendingRequestsLock.Lock()
-				if reqList, ok := pendingRequests[s.flowKey]; ok && len(reqList) > 0 {
-					//fmt.Printf("%10d: %s: response %q\n", s.streamIndex, s.lastTimestamp, lines[0])
-					req := reqList[0]
-					pendingRequests[s.flowKey] = reqList[1:]
-
-					// sanity checks
-					switch req.reqType {
-					case "PING":
-						if lines[0] != "PONG" {
-							log.Fatalf("%s: received %s response for %s", s.flowLabel, lines, req.reqType)
-						}
-					case "SET", "SETEX":
-						if lines[0] != "OK" {
-							log.Fatalf("%s: received %s:%s response for %s:%s %s", s.flowLabel, timestamp, lines, req.requestTime, req.reqType, req.key)
-						}
-					}
-
-					latency := timestamp.UnixMicro() - req.requestTime.UnixMicro()
-					if latency > 510_000 {
-						log.Fatalf("out of range latency: %s: %s %s => %s  latency: %v = %v - %v\n", s.flowLabel, req.reqType, req.key, lines[0], latency, timestamp, req.requestTime)
-					}
-					log.Printf("%s: %s %s => %s  latency: %d\n", s.flowLabel, req.reqType, req.key, lines[0], latency)
-
-					found = true
-					pendingRequestsLock.Unlock()
-					break
-				}
-				pendingRequestsLock.Unlock()
-				time.Sleep(10 * time.Millisecond)
-				s.reader.Fill()
-				// time.Sleep(1 * time.Millisecond)
-			}
-			if !found {
-				pendingRequestsLock.Lock()
-				log.Printf("map=%v\n", pendingRequests)
-				log.Fatalf("got %s response for flow %s with no matching GET", lines[0], s.flowLabel)
-				pendingRequestsLock.Unlock()
-			}
-
-		}
+		log.Printf("%s: %s: %v\n", timestamp.Format(time.StampMicro), s.flowLabel, lines)
 	}
 }
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.SetFlags(0)
 
 	if len(os.Args) != 2 {
 		log.Fatal("expected pcap filename argument")
@@ -339,6 +270,5 @@ func main() {
 	assembler.FlushAll()
 	wg.Wait()
 
-	log.Printf("read %d packets, size %d bytes, original size %d bytes, skipped %d bytes\n", count, size, originalSize,
-		atomic.LoadInt32(&totalSkippedBytes))
+	log.Printf("read %d packets, size %d bytes, original size %d bytes\n", count, size, originalSize)
 }
