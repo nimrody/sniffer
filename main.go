@@ -70,7 +70,7 @@ type redisRequest struct {
 
 var streamCount int32
 var pendingRequests = make(map[string][]redisRequest)
-var pendingRequestsLock sync.RWMutex
+var pendingRequestsLock sync.Mutex
 var wg sync.WaitGroup
 
 // redisStreamFactory implements tcpassembly.StreamFactory
@@ -111,7 +111,7 @@ func (*redisStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream 
 		clientRequest: clientRequest,
 	}
 
-	log.Printf("%10d: New flow: req: %s\n", rstream.streamIndex, rstream.flowLabel)
+	// log.Printf("%10d: New flow: req: %s\n", rstream.streamIndex, rstream.flowLabel)
 
 	// Important... we must guarantee that data from the reader stream is read.
 	wg.Add(1)
@@ -133,7 +133,7 @@ func redisReadString0(line string, timestamp time.Time, tp *tcpreader.ReaderStre
 		return "not-found", timestamp, nil
 	} else if line[0] == '$' { // beginning of a bulk string
 		n, _ := strconv.Atoi(line[1:])
-		line, timestamp, err = tp.ReadLine("redisReadString0") // TODO: should read n characters and ignore CRLF
+		line, timestamp, err = tp.ReadLineN("redisReadString0", n)
 		if err == io.EOF {
 			return line, timestamp, err
 		}
@@ -212,7 +212,7 @@ func (s *redisStream) handleRequests() {
 		pendingRequests[s.flowKey] = append(pendingRequests[s.flowKey], req)
 		pendingRequestsLock.Unlock()
 
-		log.Printf("Req:  %s: %v\n", s.flowLabel, lines)
+		// log.Printf("Req:  %s: %v\n", s.flowLabel, lines)
 	}
 }
 
@@ -232,7 +232,7 @@ func (s *redisStream) handleResponses() {
 		if err != nil {
 			log.Fatalf("Req:  %s: Error reading stream, %v", s.flowLabel, err)
 		}
-		log.Printf("Resp: %s: %v\n", s.flowLabel, lines)
+		// log.Printf("Resp: %s: %v\n", s.flowLabel, lines)
 
 		switch lines[0] {
 		case "pmessage":
@@ -244,29 +244,31 @@ func (s *redisStream) handleResponses() {
 
 			found := false
 			for i := 0; i < 50000; i++ {
-				pendingRequestsLock.RLock()
+				pendingRequestsLock.Lock()
 				if reqList, ok := pendingRequests[s.flowKey]; ok && len(reqList) > 0 {
 					//fmt.Printf("%10d: %s: response %q\n", s.streamIndex, s.lastTimestamp, lines[0])
 					req := reqList[0]
 					pendingRequests[s.flowKey] = reqList[1:]
 					latency := timestamp.UnixMicro() - req.requestTime.UnixMicro()
-					if latency > 10000 {
+					if latency > 200_000 {
 						log.Fatalf("out of range latency: %s: %s %s => %s  latency: %v = %v - %v\n", s.flowLabel, req.reqType, req.key, lines[0], latency, timestamp, req.requestTime)
 					}
 					log.Printf("%s: %s %s => %s  latency: %d\n", s.flowLabel, req.reqType, req.key, lines[0], latency)
 
 					found = true
-					pendingRequestsLock.RUnlock()
+					pendingRequestsLock.Unlock()
 					break
 				}
-				pendingRequestsLock.RUnlock()
+				pendingRequestsLock.Unlock()
 				time.Sleep(10 * time.Millisecond)
 				s.reader.Fill()
 				// time.Sleep(1 * time.Millisecond)
 			}
 			if !found {
+				pendingRequestsLock.Lock()
 				log.Printf("map=%v\n", pendingRequests)
 				log.Fatalf("got %s response for flow %s with no matching GET", lines[0], s.flowLabel)
+				pendingRequestsLock.Unlock()
 			}
 
 		}

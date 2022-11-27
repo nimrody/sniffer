@@ -46,7 +46,6 @@
 package tcpreader
 
 import (
-	"fmt"
 	"io"
 	"log"
 	"strings"
@@ -94,6 +93,20 @@ type ReaderStreamOptions struct {
 	LossErrors bool
 }
 
+var defaultTime, errTime time.Time
+
+func init() {
+	var err error
+	defaultTime, err = time.Parse(time.RFC3339, "2000-01-01T00:00:00Z")
+	if err != nil {
+		log.Fatal("failed to parse time", err)
+	}
+	errTime, err = time.Parse(time.RFC3339, "2002-01-01T00:00:00Z")
+	if err != nil {
+		log.Fatal("failed to parse time", err)
+	}
+}
+
 // NewReaderStream returns a new ReaderStream object.
 func NewReaderStream(label string) *ReaderStream {
 	return &ReaderStream{
@@ -108,13 +121,13 @@ func (r *ReaderStream) Reassembled(reassembly []tcpassembly.Reassembly) {
 	if !r.initiated {
 		panic("ReaderStream not created via NewReaderStream")
 	}
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%d:[", len(reassembly)))
-	for _, segment := range reassembly {
-		sb.WriteString(fmt.Sprintf("%q,", string(segment.Bytes)))
-	}
-	sb.WriteByte(']')
-	log.Printf("%s: Reassembled: %v\n", r.label, sb.String())
+	// var sb strings.Builder
+	// sb.WriteString(fmt.Sprintf("%d:[", len(reassembly)))
+	// for _, segment := range reassembly {
+	// 	sb.WriteString(fmt.Sprintf("%q,", string(segment.Bytes)))
+	// }
+	// sb.WriteByte(']')
+	// log.Printf("%s: Reassembled: %v\n", r.label, sb.String())
 
 	reassemblyClone := make([]tcpassembly.Reassembly, len(reassembly))
 	for i := 0; i < len(reassembly); i++ {
@@ -166,7 +179,7 @@ func (r *ReaderStream) read() (byte, time.Time, error) {
 	r.currentByteIndex = 0
 
 	if !ok {
-		return 0, time.Time{}, io.EOF
+		return 0, errTime, io.EOF
 	}
 
 	return r.read()
@@ -190,20 +203,65 @@ func (r *ReaderStream) ReadLine(caller string) (string, time.Time, error) {
 	for {
 		b, timestamp, error := r.read()
 		if error != nil {
-			fmt.Printf("ReadString %s returned ERROR %q %q\n", caller, error, io.EOF)
+			// fmt.Printf("ReadString %s returned ERROR %q %q\n", caller, error, io.EOF)
 			return sb.String(), timestamp, error
 		}
 		sb.WriteByte(b) // will return the delimiter too
 		if b == '\n' {
 			line := strings.TrimSuffix(sb.String(), "\r\n")
 
-			log.Printf("%p ReadString %v returned %q\n", r, caller, line)
+			// log.Printf("%p ReadString %v returned %q\n", r, caller, line)
 			if len(line) == 0 {
 				log.Fatalf("empty line %s\n", sb.String())
 			}
 			return line, timestamp, nil
 		}
 	}
+}
+
+// read n characters. Expects \r\n following these characters
+func (r *ReaderStream) ReadLineN(caller string, n int) (string, time.Time, error) {
+	var sb strings.Builder
+	var timestamp time.Time = defaultTime
+
+	if n <= 0 {
+		panic("ReadLineN called with n <= 0")
+	}
+
+	var b byte
+	var err error
+
+	for i := 0; i < n; i++ {
+		b, timestamp, err = r.read()
+		if err != nil {
+			// log.Printf("ReadString %s returned ERROR %q %q\n", caller, err, io.EOF)
+			return sb.String(), timestamp, err
+		}
+		sb.WriteByte(b) // will return the delimiter too
+	}
+
+	line := sb.String()
+
+	b, _, error := r.read()
+	if error != nil {
+		return sb.String(), timestamp, error
+	}
+
+	if b != '\r' {
+		log.Fatalf("ReadString %s expected CR, found %c, line: %s", caller, b, line)
+	}
+
+	b, _, error = r.read()
+
+	if b != '\n' {
+		log.Fatalf("ReadString %s expected LF, found %c, line: %s", caller, b, line)
+	}
+
+	// log.Printf("%p ReadString %v returned %q\n", r, caller, line)
+	if len(line) == 0 {
+		log.Fatalf("empty line")
+	}
+	return line, timestamp, nil
 }
 
 func (r *ReaderStream) Fill() {
