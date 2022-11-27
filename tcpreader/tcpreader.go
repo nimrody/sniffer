@@ -46,41 +46,13 @@
 package tcpreader
 
 import (
-	"errors"
+	"fmt"
 	"io"
+	"strings"
+	"time"
 
 	"github.com/google/gopacket/tcpassembly"
 )
-
-var discardBuffer = make([]byte, 4096)
-
-// DiscardBytesToFirstError will read in all bytes up to the first error
-// reported by the given reader, then return the number of bytes discarded
-// and the error encountered.
-func DiscardBytesToFirstError(r io.Reader) (discarded int, err error) {
-	for {
-		n, e := r.Read(discardBuffer)
-		discarded += n
-		if e != nil {
-			return discarded, e
-		}
-	}
-}
-
-// DiscardBytesToEOF will read in all bytes from a Reader until it
-// encounters an io.EOF, then return the number of bytes.  Be careful
-// of this... if used on a Reader that returns a non-io.EOF error
-// consistently, this will loop forever discarding that error while
-// it waits for an EOF.
-func DiscardBytesToEOF(r io.Reader) (discarded int) {
-	for {
-		n, e := DiscardBytesToFirstError(r)
-		discarded += n
-		if e == io.EOF {
-			return
-		}
-	}
-}
 
 // ReaderStream implements both tcpassembly.Stream and io.Reader.  You can use it
 // as a building block to make simple, easy stream handlers.
@@ -106,13 +78,10 @@ func DiscardBytesToEOF(r io.Reader) (discarded int) {
 //	}
 type ReaderStream struct {
 	ReaderStreamOptions
-	reassembled  chan []tcpassembly.Reassembly
-	done         chan bool
-	current      []tcpassembly.Reassembly
-	closed       bool
-	lossReported bool
-	first        bool
-	initiated    bool
+	reassembled      chan []tcpassembly.Reassembly
+	current          []tcpassembly.Reassembly
+	currentByteIndex int
+	initiated        bool
 }
 
 // ReaderStreamOptions provides user-resettable options for a ReaderStream.
@@ -127,8 +96,6 @@ type ReaderStreamOptions struct {
 func NewReaderStream() ReaderStream {
 	r := ReaderStream{
 		reassembled: make(chan []tcpassembly.Reassembly, 1000),
-		done:        make(chan bool, 1000),
-		first:       true,
 		initiated:   true,
 	}
 	return r
@@ -139,74 +106,87 @@ func (r *ReaderStream) Reassembled(reassembly []tcpassembly.Reassembly) {
 	if !r.initiated {
 		panic("ReaderStream not created via NewReaderStream")
 	}
-	r.reassembled <- reassembly
-	<-r.done
-}
-
-// ReassemblyComplete implements tcpassembly.Stream's ReassemblyComplete function.
-func (r *ReaderStream) ReassemblyComplete() {
-	close(r.reassembled)
-	close(r.done)
-}
-
-// stripEmpty strips empty reassembly slices off the front of its current set of
-// slices.
-func (r *ReaderStream) stripEmpty() {
-	for len(r.current) > 0 && len(r.current[0].Bytes) == 0 {
-		r.current = r.current[1:]
-		r.lossReported = false
+	select {
+	case r.reassembled <- reassembly:
+	default:
+		panic("blocked on sending to channel")
 	}
 }
 
-// DataLost is returned by the ReaderStream's Read function when it encounters
-// a Reassembly with Skip != 0.
-var DataLost = errors.New("lost data")
+// ReassemblyComplete implements tcpassembly.Stream's ReassemblyComplete function.
+// Called when the TCP stream is closed
+func (r *ReaderStream) ReassemblyComplete() {
+	close(r.reassembled)
+}
 
 // Read implements io.Reader's Read function.
 // Given a byte slice, it will either copy a non-zero number of bytes into
 // that slice and return the number of bytes and a nil error, or it will
 // leave slice p as is and return 0, io.EOF.
-func (r *ReaderStream) Read(p []byte) (int, error) {
+func (r *ReaderStream) read() (byte, time.Time, error) {
 	if !r.initiated {
 		panic("ReaderStream not created via NewReaderStream")
 	}
-	var ok bool
-	r.stripEmpty()
-	for !r.closed && len(r.current) == 0 {
-		if r.first {
-			r.first = false
-		} else {
-			r.done <- true
-		}
-		if r.current, ok = <-r.reassembled; ok {
-			r.stripEmpty()
-		} else {
-			r.closed = true
-		}
-	}
+
+	// we have a segment to read from
 	if len(r.current) > 0 {
-		current := &r.current[0]
-		if r.LossErrors && !r.lossReported && current.Skip != 0 {
-			r.lossReported = true
-			return 0, DataLost
+		// not yet done with this segment
+		if r.currentByteIndex < len(r.current[0].Bytes) {
+			b := r.current[0].Bytes[r.currentByteIndex]
+			r.currentByteIndex++
+			return b, r.current[0].Seen, nil
 		}
-		length := copy(p, current.Bytes)
-		current.Bytes = current.Bytes[length:]
-		return length, nil
+
+		// otherwise, done with the current segment. Prepare for the next
+		r.currentByteIndex = 0
+		r.current = r.current[1:]
+		return r.read()
 	}
-	return 0, io.EOF
+
+	// no segments - fetch from channel
+	var ok bool
+	r.current, ok = <-r.reassembled
+	r.currentByteIndex = 0
+
+	if !ok {
+		return 0, time.Time{}, io.EOF
+	}
+
+	return r.read()
 }
 
 // Close implements io.Closer's Close function, making ReaderStream a
 // io.ReadCloser.  It discards all remaining bytes in the reassembly in a
 // manner that's safe for the assembler (IE: it doesn't block).
 func (r *ReaderStream) Close() error {
-	r.current = nil
-	r.closed = true
+	panic("closed called")
+	// r.current = nil
+	// for {
+	// 	if _, ok := <-r.reassembled; !ok {
+	// 		return nil
+	// 	}
+	// }
+}
+
+func (r *ReaderStream) ReadLine(caller string) (string, time.Time, error) {
+	var sb strings.Builder
 	for {
-		if _, ok := <-r.reassembled; !ok {
-			return nil
+		b, timestamp, error := r.read()
+		if error != nil {
+			fmt.Printf("ReadString %s returned ERROR %q %q\n", caller, error, io.EOF)
+			return sb.String(), timestamp, error
 		}
-		r.done <- true
+		sb.WriteByte(b) // will return the delimiter too
+		if b == '\n' {
+			line := strings.TrimSuffix(sb.String(), "\r\n")
+
+			// fmt.Printf("ReadString %v returned %q\n", caller, line)
+			return line, timestamp, nil
+		}
 	}
+}
+
+func (r *ReaderStream) Fill() {
+	// panic("todo")
+	// nop
 }

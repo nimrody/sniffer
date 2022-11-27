@@ -15,7 +15,6 @@ import (
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 	"github.com/google/gopacket/tcpassembly"
-	"github.com/nimrody/my-sinffer/bufio"
 	"github.com/nimrody/my-sinffer/tcpreader"
 )
 
@@ -65,13 +64,14 @@ const (
 
 type redisRequest struct {
 	reqType     string
-	key         string // key for GET, SET, EXPIRE commands
-	requestTime time.Time
+	key         string    // key for GET, SET, EXPIRE commands
+	requestTime time.Time // when the request was initiated
 }
 
 var streamCount int32
 var pendingRequests = make(map[string][]redisRequest)
 var pendingRequestsLock sync.RWMutex
+var wg sync.WaitGroup
 
 // redisStreamFactory implements tcpassembly.StreamFactory
 type redisStreamFactory struct{}
@@ -80,25 +80,10 @@ type redisStreamFactory struct{}
 type redisStream struct {
 	net, transport gopacket.Flow
 	flowKey        string
+	flowLabel      string // what we display in logs
 	reader         tcpreader.ReaderStream
 	streamIndex    int32
-	lastTimestamp  time.Time
 	clientRequest  bool // true if this is a flow from the client to the server, false otherwise
-}
-
-// Reassembled implements tcpassembly.Stream
-func (s *redisStream) Reassembled(segments []tcpassembly.Reassembly) {
-	// log.Printf("%10d: New %d segment: req: %s   %v\n", s.streamIndex, len(segments), s.flowKey, s.clientRequest)
-	for i, segment := range segments {
-		s.lastTimestamp = segment.Seen
-		s.reader.Reassembled(segments[i : i+1])
-		// fmt.Printf("%10d: processed 1-segment: req: %s   %v\n", s.streamIndex, s.flowKey, s.clientRequest)
-	}
-}
-
-// ReassemblyComplete implements tcpassembly.Stream
-func (s *redisStream) ReassemblyComplete() {
-	s.reader.ReassemblyComplete()
 }
 
 func (*redisStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream {
@@ -106,57 +91,51 @@ func (*redisStreamFactory) New(net, transport gopacket.Flow) tcpassembly.Stream 
 	dstPort := uint16(dstPortRaw[0])<<8 | uint16(dstPortRaw[1])
 	clientRequest := dstPort == redisPort
 
-	var flowKey string
+	var flowKey, flowLabel string
 	if clientRequest {
 		// dst is the server
 		flowKey = fmt.Sprintf("%s:%s->%s:%s", net.Src(), transport.Src(), net.Dst(), transport.Dst())
+		flowLabel = flowKey
 	} else {
 		flowKey = fmt.Sprintf("%s:%s->%s:%s", net.Dst(), transport.Dst(), net.Src(), transport.Src())
+		flowLabel = strings.ReplaceAll(flowKey, "->", "<=")
 	}
 
 	rstream := &redisStream{
 		net:           net,
 		transport:     transport,
 		flowKey:       flowKey,
+		flowLabel:     flowLabel,
 		reader:        tcpreader.NewReaderStream(),
 		streamIndex:   atomic.AddInt32(&streamCount, 1),
-		lastTimestamp: time.Time{},
 		clientRequest: clientRequest,
 	}
 
-	fmt.Printf("%10d: New flow: req: %s   %v\n", rstream.streamIndex, rstream.flowKey, rstream.clientRequest)
+	log.Printf("%10d: New flow: req: %s\n", rstream.streamIndex, rstream.flowLabel)
 
 	// Important... we must guarantee that data from the reader stream is read.
+	wg.Add(1)
 	if rstream.clientRequest {
 		go rstream.handleRequests()
 	} else {
 		go rstream.handleResponses()
 	}
 	// ReaderStream implements tcpassembly.Stream, so we can return a pointer to it.
-	return rstream
-}
-
-func readLine(tp *bufio.Reader) (string, error) {
-	line, err := tp.ReadString('\n')
-	if err != nil {
-		return "", err
-	}
-	line = strings.TrimSuffix(line, "\r\n")
-	return line, err
+	return &rstream.reader
 }
 
 // read a single simple string "+XXX\n" or a bulk string "$n\nXXXXX\n"
-func redisReadString0(line string, tp *bufio.Reader) (string, error) {
+func redisReadString0(line string, timestamp time.Time, tp *tcpreader.ReaderStream) (string, time.Time, error) {
 	var err error
 	if line[0] == '+' { // beginning of a simple string
 		line = line[1:]
 	} else if line == "$-1" { // null response (value not found in cache)
-		return "not-found", nil
+		return "not-found", timestamp, nil
 	} else if line[0] == '$' { // beginning of a bulk string
 		n, _ := strconv.Atoi(line[1:])
-		line, err = readLine(tp) // TODO: should read n characters and ignore CRLF
+		line, timestamp, err = tp.ReadLine("redisReadString0") // TODO: should read n characters and ignore CRLF
 		if err == io.EOF {
-			return "", err
+			return line, timestamp, err
 		}
 		if len(line) < n {
 			log.Fatal(fmt.Sprintf("expected %d characters, got %d characters: %s", n, len(line), line))
@@ -164,22 +143,22 @@ func redisReadString0(line string, tp *bufio.Reader) (string, error) {
 	} else if line[0] == ':' {
 		line = line[1:] // XXX: we return numbers as strings
 	}
-	return line, nil
+	return line, timestamp, nil
 }
 
-func redisReadString(tp *bufio.Reader) (string, error) {
-	line, err := readLine(tp)
+func redisReadString(tp *tcpreader.ReaderStream) (string, time.Time, error) {
+	line, timestamp, err := tp.ReadLine("redisReadString")
 	if err == io.EOF {
-		return "", err
+		return line, timestamp, err
 	}
-	return redisReadString0(line, tp)
+	return redisReadString0(line, timestamp, tp)
 }
 
-func redisReadArray(tp *bufio.Reader) ([]string, error) {
-	line, err := readLine(tp)
+func redisReadArray(tp *tcpreader.ReaderStream) ([]string, time.Time, error) {
+	line, timestamp, err := tp.ReadLine("redisReadArray")
 	if err != nil {
 		// We must read until we see an EOF... very important!
-		return []string{}, err
+		return []string{}, timestamp, err
 	}
 	// beginning of an array (used for sending commnads or keyevent responses)
 	if line[0] == '*' {
@@ -190,27 +169,27 @@ func redisReadArray(tp *bufio.Reader) ([]string, error) {
 		// read n strings
 		lines := make([]string, 0, n)
 		for i := 0; i < n; i++ {
-			line, err = redisReadString(tp)
+			line, timestamp, err = redisReadString(tp)
 			if err != nil {
-				return []string{}, err
+				return []string{}, timestamp, err
 			}
 			lines = append(lines, line)
 		}
-		return lines, nil
+		return lines, timestamp, nil
 	}
 
 	// otherwise it's either a simple string or a bulk string
-	line, err = redisReadString0(line, tp)
+	line, timestamp, err = redisReadString0(line, timestamp, tp)
 	if err != nil {
 		log.Fatal("redisReadArray", err)
 	}
-	return []string{line}, err
+	return []string{line}, timestamp, err
 }
 
 func (s *redisStream) handleRequests() {
-	tp := bufio.NewReaderSize(&s.reader, bufSize)
+	defer wg.Done()
 	for {
-		lines, err := redisReadArray(tp)
+		lines, timestamp, err := redisReadArray(&s.reader)
 		if err == io.EOF {
 			// We must read until we see an EOF... very important!
 			return
@@ -226,13 +205,13 @@ func (s *redisStream) handleRequests() {
 			key = lines[1] // key is always the first agument (for GET/SET/EXPIRE)
 		}
 
-		req := redisRequest{reqType: command, key: key, requestTime: s.lastTimestamp}
+		req := redisRequest{reqType: command, key: key, requestTime: timestamp}
 
 		pendingRequestsLock.Lock()
 		pendingRequests[s.flowKey] = append(pendingRequests[s.flowKey], req)
 		pendingRequestsLock.Unlock()
 
-		// fmt.Printf("%10d: %s: %s:%s -> %s:%s: %s\n", s.streamIndex, s.lastTimestamp, s.net.Src(), s.transport.Src(), s.net.Dst(), s.transport.Dst(), line)
+		log.Printf("Req:  %s: %v\n", s.flowLabel, lines)
 	}
 }
 
@@ -241,23 +220,25 @@ Responses are typically a single value (OK, PONG, get-response) but
 may also be arrays if this is a key event
 */
 func (s *redisStream) handleResponses() {
-	tp := bufio.NewReaderSize(&s.reader, bufSize)
+	defer wg.Done()
 	for {
-		lines, err := redisReadArray(tp)
+		lines, timestamp, err := redisReadArray(&s.reader)
 		if err == io.EOF {
 			// We must read until we see an EOF... very important!
+			log.Printf("Resp: %s: received EOF\n", s.flowLabel)
 			return
 		}
 		if err != nil {
 			log.Fatal("Error reading stream", err)
 		}
+		log.Printf("Resp: %s: %v\n", s.flowLabel, lines)
 
 		switch lines[0] {
 		case "pmessage":
 			// keyevent message - ignore
 		default:
 			if len(lines) > 1 {
-				log.Fatalf("expected 1 value response, got %q", lines)
+				log.Fatalf("%10d: %s: expected 1 value response, got %q", s.streamIndex, s.flowLabel, lines)
 			}
 
 			found := false
@@ -267,28 +248,27 @@ func (s *redisStream) handleResponses() {
 					//fmt.Printf("%10d: %s: response %q\n", s.streamIndex, s.lastTimestamp, lines[0])
 					req := reqList[0]
 					pendingRequests[s.flowKey] = reqList[1:]
-					latency := s.lastTimestamp.UnixMicro() - req.requestTime.UnixMicro()
+					latency := timestamp.UnixMicro() - req.requestTime.UnixMicro()
 					if latency > 10000 {
-						log.Fatalf("out of range latency: %s: %s %s => %s  latency: %v = %v - %v\n", s.flowKey, req.reqType, req.key, lines[0], latency, s.lastTimestamp, req.requestTime)
+						log.Fatalf("out of range latency: %s: %s %s => %s  latency: %v = %v - %v\n", s.flowLabel, req.reqType, req.key, lines[0], latency, timestamp, req.requestTime)
 					}
-					fmt.Printf("%s: %s %s => %s  latency: %d\n", s.flowKey, req.reqType, req.key, lines[0], latency)
+					log.Printf("%s: %s %s => %s  latency: %d\n", s.flowLabel, req.reqType, req.key, lines[0], latency)
 
 					found = true
 					pendingRequestsLock.RUnlock()
 					break
 				}
 				pendingRequestsLock.RUnlock()
-				tp.Fill()
+				s.reader.Fill()
 				// time.Sleep(1 * time.Millisecond)
 			}
 			if !found {
-				log.Printf("map=%v", pendingRequests)
-				log.Fatalf("got %s response for flow %s with no matching GET", lines[0], s.flowKey)
+				log.Printf("map=%v\n", pendingRequests)
+				log.Fatalf("got %s response for flow %s with no matching GET", lines[0], s.flowLabel)
 			}
 
 		}
 	}
-
 }
 
 func main() {
@@ -335,5 +315,7 @@ func main() {
 
 	}
 	assembler.FlushAll()
-	fmt.Printf("read %d packets, size %d bytes, original size %d bytes\n", count, size, originalSize)
+	wg.Wait()
+
+	log.Printf("read %d packets, size %d bytes, original size %d bytes\n", count, size, originalSize)
 }
